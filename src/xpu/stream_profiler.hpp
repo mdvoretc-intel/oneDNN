@@ -17,14 +17,18 @@
 #ifndef XPU_STREAM_PROFILER_HPP
 #define XPU_STREAM_PROFILER_HPP
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "common/c_types_map.hpp"
+#include "common/utils.hpp"
+#include "common/verbose_profiler.hpp"
 
 #include "xpu/context.hpp"
 
@@ -61,6 +65,19 @@ struct stream_profiler_t {
 
     uint64_t stamp() const { return stamp_; }
 
+    status_t count_entries(
+            profiling_data_kind_t data_kind, int *num_entries) const {
+        if (data_kind == profiling_data_kind::time_per_kernel) {
+            *num_entries = (int)events_.size();
+            return status::success;
+        }
+        std::unordered_set<uint64_t> seen;
+        for (auto &ev : events_)
+            seen.insert(ev.stamp);
+        *num_entries = (int)seen.size();
+        return status::success;
+    }
+
     void register_event(std::unique_ptr<xpu::event_t> &&event) {
         events_.emplace_back(std::move(event), stamp_);
     }
@@ -93,6 +110,46 @@ struct stream_profiler_t {
     }
 
 protected:
+    // Per-event start/end in nanoseconds.
+    virtual status_t query_event_time(
+            const xpu::event_t &, uint64_t &, uint64_t &) const {
+        return status::unimplemented;
+    }
+
+    virtual status_t query_event_freq(
+            const xpu::event_t &, double &freq) const {
+        freq = 0.0;
+        return status::success;
+    }
+
+    status_t get_info_generic(profiling_data_kind_t data_kind, int *num_entries,
+            uint64_t *data) const {
+        if (!num_entries) return status::invalid_arguments;
+        bool is_per_kernel
+                = (data_kind == profiling_data_kind::time_per_kernel);
+        if (!data) return count_entries(data_kind, num_entries);
+
+        std::map<uint64_t, entry_t> stamp2entry;
+        int idx = 0;
+        for (auto &ev : events_) {
+            uint64_t beg = 0, end = 0;
+            CHECK(query_event_time(*ev.event, beg, end));
+            if (is_per_kernel) {
+                data[idx++] = end - beg;
+                continue;
+            }
+            double freq = 0.0;
+            CHECK(query_event_freq(*ev.event, freq));
+            auto &entry = stamp2entry[ev.stamp];
+            entry.min_nsec = std::min(entry.min_nsec, beg);
+            entry.max_nsec = std::max(entry.max_nsec, end);
+            entry.freq += freq;
+            entry.kernel_count++;
+        }
+        if (is_per_kernel) return status::success;
+        return get_info_impl(stamp2entry, data_kind, data);
+    }
+
     status_t get_info_impl(const std::map<uint64_t, entry_t> &stamp2entry,
             profiling_data_kind_t data_kind, uint64_t *data) const {
         int idx = 0;
@@ -121,28 +178,13 @@ protected:
     void (*callback_)(uint64_t, uint64_t) = nullptr;
 };
 
-// The verbose profiler logs primitive profiling information using device-
-// measured execution times without host-to-device synchronization overhead or
-// blocking stream.wait() calls. It operates asynchronously by polling device
-// events to track primitive completion status.
-// During primitive execution, the profiler groups and registers kernel events
-// for each primitive with the associated profiling metadata. During each
-// primitive post-exec hook, it polls previously registered events to identify
-// completed primitives and logs their timing info. Pending primitives remain
-// in the profiling_data_ list until detected as complete in subsequent
-// polling cycles.
-// During profiler destruction, any remaining primitives are checked and
-// waited for to ensure no executions are left unlogged.
-// This profiler is intended to be thread-local via thread_local_storage_t,
-// ensuring thread-safety for multi-threaded execution environments. Each
-// thread maintains its own profiler instance and event tracking state,
-// operating independently from other stream profilers during primitive
-// execution.
-struct verbose_profiler_t {
-    verbose_profiler_t(const stream_t *stream)
-        : stream_(stream), active_(true) {}
-
-    virtual ~verbose_profiler_t() = default;
+// XPU (OpenCL/SYCL/L0) specialization of verbose_profiler_t.
+// Tracks primitive completion using device-side xpu::event_t handles.
+// Device-measured execution times are retrieved via get_aggregate_exec_time()
+// using runtime-specific event timestamp queries.
+// Instantiated per-thread via thread_local_storage_t on the GPU stream.
+struct verbose_profiler_t : public impl::verbose_profiler_t {
+    using impl::verbose_profiler_t::verbose_profiler_t;
 
     struct prim_profile_data_t {
         uint64_t component_kind_ = 0;
@@ -150,33 +192,8 @@ struct verbose_profiler_t {
         std::string pd_info_;
         std::vector<std::shared_ptr<xpu::event_t>> prim_events_;
     };
-    // Pausing capabilities are added to allow skipping event profiling
-    // queries when they are temporarily unavailable (example:
-    // SYCL graph execution or when queue does not have profiling enabled).
-    // These methods check and update profiler status where such force-pausing
-    // is required. Pausing action is localized to each thread for multi-
-    // threaded execution
-    bool is_active() const { return true; }
-    void start_profiling() { active_ = true; }
-    void pause_profiling() { active_ = false; }
 
-    // The profiler operates through a multi-step event tracking workflow:
-    // 1. stream->before_exec_hook() calls update_event_list()
-    //    to add a new entry for the current primitive. Since there can be
-    //    multiple `register_event` calls, this spot is a guaranteed single
-    //    call for the coming primitive.
-    // 2. During primitive execution, register_event() adds device
-    //    events to the latest primitive entry corresponding to the number of
-    //    invoked kernels.
-    // 3. add_to_pending_primitive_list() stores profiling metadata
-    //    (start_ms_, pd_info_) for the registered primitive
-    // 4. stream->after_exec_hook() calls check_for_completed_primitives()
-    //    to poll events and log completed primitives
-    // 5. Incomplete primitives remain in profiling_data_ until detected as
-    //    complete in future polling cycles
-    // This asynchronous workflow allows tracking multiple concurrent
-    // primitives without blocking execution.
-    void update_event_list() { profiling_data_.emplace_back(); }
+    void update_event_list() override { profiling_data_.emplace_back(); }
 
     // appends primitive event to the last primitive entry in profiling_data_
     void register_event(const std::shared_ptr<xpu::event_t> &event) {
@@ -186,29 +203,27 @@ struct verbose_profiler_t {
 
     // populates profiling metadata for the last primitive entry in
     // profiling_data_
-    void add_to_pending_primitive_list(
-            double start_ms, const std::string &pd_info, uint64_t component);
+    void add_to_pending_primitive_list(double start_ms,
+            const std::string &pd_info, uint64_t component) override;
 
     // Completed primitive executions are periodically checked and logged
     // during after_exec_hook() calls and during stream destruction.
     // The profiler does not wait for pending events to complete
     // and instead prints them at the next concurrent after_exec_hook()
     // call.
-    void check_for_completed_primitives();
+    void check_for_completed_primitives() override;
 
 protected:
-    const stream_t *stream_;
     std::vector<prim_profile_data_t> profiling_data_;
-    bool active_;
 
     // destructor logic to check for unlogged primitives before
     // stream destruction
     void cleanup();
 
 private:
-    // This is invoked during profiler destruction or blocking wait calls
-    //  to account for any pending primitives that have not yet been logged.
-    void wait_for_pending_primitives();
+    // This is invoked during profiler destruction to account for any
+    // pending primitives that have not yet been logged.
+    void wait_for_pending_primitives() override;
 
     void reset() { profiling_data_.clear(); }
 

@@ -120,6 +120,15 @@ void GEMMStrategy::preflight(HW hw, const GEMMProblem &problem)
     if (kParallelVariable && problem.batch != BatchMode::None)
         C.atomic = CO.atomic = kParallelVariable = kParallelLocal = false;
 
+    // Stream-K combines per-workgroup partial C via atomic add, which is
+    // safe for plain grouped scaling (no cross-workgroup shared state) but
+    // not late 2D scaling.
+    bool aLateScale = usesLateScale(problem, *this, /*isA=*/true);
+    bool bLateScale = usesLateScale(problem, *this, /*isA=*/false);
+    bool lateScaleHazard = (aLateScale || bLateScale) && problem.Tc_ext.isInteger();
+    if (kParallelVariable && lateScaleHazard)
+        C.atomic = CO.atomic = kParallelVariable = kParallelLocal = false;
+
     C.atomic |= useAutoAtomic(hw, problem, *this);
 
     if (C.atomic && !C.base.isStateless() && !C.newDP)
@@ -625,6 +634,10 @@ void MatrixAddressingStrategy::preflight(HW hw)
 {
     newDP |= isBlock2D(accessType) || (hw >= HW::Xe2);
     padded |= (base.getModel() == ModelSLM);
+
+    // Xe3p uses sendg[x] instructions: downgrade surface accesses to a64
+    if (hw == HW::Xe3p && base.getModel() == ModelBTS)
+        forceA64();
 
     if (prefetch && newDP && cachingR == CacheSettingsLSC::Default)
         cachingR = CacheSettingsLSC::L1C_L3C;

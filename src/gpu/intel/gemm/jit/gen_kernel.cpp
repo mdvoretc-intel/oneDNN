@@ -21,6 +21,7 @@
 #include "common/type_helpers.hpp"
 #include "common/utils.hpp"
 #include "gemmstone/../../generator/pieces/compute_utils.hpp"
+#include "gemmstone/../../generator/pieces/ngen_object_helpers.hpp"
 #include "gemmstone/../../generator_dsl/builder.hpp"
 #include "gemmstone/../../generator_dsl/kernel_desc.hpp"
 #include "gemmstone/dsl/dsl.hpp"
@@ -67,6 +68,7 @@ status_t gen_desc_t::create_generator(
 
 compute::scalar_type_t gen_desc_t::scalar_type() const {
     switch (problem_.Ts) {
+        case Type::u2: return compute::scalar_type_t::_uint2;
         case Type::s4: return compute::scalar_type_t::_int4;
         case Type::u4: return compute::scalar_type_t::_uint4;
         case Type::s8: return compute::scalar_type_t::_char;
@@ -100,16 +102,22 @@ static gemmstone::Scalar stringToScalar(std::string val) {
 
 status_t gen_desc_t::finalize(const char *tags) {
     // Update problem alignments to match catalog entry.
+    // Do not raise an alignment above the actual buffer alignment: catalog
+    // entries may accept lower alignments than driverInfo.alignment via
+    // unaligned access fallbacks, and overstating the alignment can cause
+    // illegal accesses (e.g. 2D block loads on a sub-DWord pitch).
     if (!isPacked(problem_.A.layout)
             && problem_.Ta_ext.paddedSize() >= problem_.Ta.paddedSize()) {
-        problem_.A.setAlignment(std::max(
-                problem_.Ta_ext.paddedSize(), entry_->driverInfo.alignment[0]));
+        problem_.A.setAlignment(std::max(problem_.Ta_ext.paddedSize(),
+                std::min(entry_->driverInfo.alignment[0],
+                        int(problem_.A.alignment))));
     }
 
     if (!isPacked(problem_.B.layout)
             && problem_.Tb_ext.paddedSize() >= problem_.Tb.paddedSize()) {
-        problem_.B.setAlignment(std::max(
-                problem_.Tb_ext.paddedSize(), entry_->driverInfo.alignment[1]));
+        problem_.B.setAlignment(std::max(problem_.Tb_ext.paddedSize(),
+                std::min(entry_->driverInfo.alignment[1],
+                        int(problem_.B.alignment))));
     }
 
     if (!isPacked(problem_.C.layout)) {
@@ -171,7 +179,7 @@ status_t gen_desc_t::finalize(const char *tags) {
         problem_.beta = stringToScalar(val);
 
         ovr_strategy = ss.str().substr(ss.tellg()); // remaining string
-        parseStrategy(ovr_strategy, hw_, problem_, strategy_);
+        parseStrategy(ovr_strategy, problem_, strategy_);
 
         // TODO: override derived values in aux_params_ in a way that's
         // consistent with the kernel evaluator (typically requires extra
@@ -192,11 +200,13 @@ status_t gen_desc_t::finalize(const char *tags) {
 #endif
         strategy_.unroll[LoopM] = entry_->driverInfo.unroll[LoopM];
         strategy_.unroll[LoopN] = entry_->driverInfo.unroll[LoopN];
-        parseStrategy(entry_->strategy, hw_, problem_, strategy_);
+        parseStrategy(entry_->strategy, problem_, strategy_);
 #ifdef DNNL_DEV_MODE
     }
 #endif
     modifyStrategy(strategy_, aux_params_);
+    if (l1_flush_wa_)
+        strategy_.C.cachingW = makeL1Uncacheable(strategy_.C.cachingW);
     strategy_.panelCheck
             |= (isPacked(problem_.A.layout) || isPacked(problem_.B.layout));
 
@@ -308,8 +318,7 @@ status_t gen_desc_t::finalize(const char *tags) {
 
     strategy_.relaxedAccumulation |= relaxed_acc_;
     strategy_.systolicAvailable &= !disable_systolic_;
-    if (problem_.needsAGroupSums() || problem_.needsBGroupSums())
-        problem_.autoTypeConversions(strategy_.systolicAvailable);
+    problem_.autoTypeConversions(strategy_.systolicAvailable);
     adjustStrategy(hw_, problem_, strategy_, tags);
     try {
         strategy_.preflight(hw_, problem_);
@@ -398,6 +407,7 @@ gen_nocopy_desc_t::select_kernel(const compute::device_info_t &dev_info,
     arch_ = convert_ngen_arch_to_dnnl(hw_);
     stepping_ = dev_info.stepping_id();
     problem_.product = product_;
+    l1_flush_wa_ = dev_info.has_l1_flush_bug();
     m_ = into<int>(m);
     n_ = into<int>(n);
     k_ = into<int>(k);
@@ -503,20 +513,21 @@ gen_nocopy_desc_t::select_kernel(const compute::device_info_t &dev_info,
 
     add_mode_matches(fpmath_bf16, [](Type dt) -> const char * {
         if (dt == Type::f32) { return "[SB]"; }
-        if (dt.isInt8() || dt.isInt4()) return "[OB]";
+        if (dt.isInt8() || dt.isSubByteInt()) return "[OB]";
         if (dt.isF4()) return "F";
         return nullptr;
     });
 
     add_mode_matches(fpmath_f16, [](Type dt) -> const char * {
         if (dt == Type::f32) { return "[SH]"; }
-        if (dt.isInt8() || dt.isInt4()) return "[OH]";
+        if (dt.isInt8() || dt.isSubByteInt()) return "[OH]";
         if (dt.isF4()) return "F";
         return nullptr;
     });
 
     add_mode_matches(!(fpmath_f16 || fpmath_bf16), [](Type dt) -> const char * {
-        if (dt.isInt4()) return "[FO]";
+        if (dt.bits() == 2) return "[PO]";
+        if (dt.bits() == 4) return "[FO]";
         return nullptr;
     });
 
@@ -581,7 +592,7 @@ status_t gen_nocopy_desc_t::finalize() {
         if (T.isF8() && T_new.isF8()) return;
         if (T.isFP() && T.bits() == 16 && T_new.isFP() && T_new.bits() == 16)
             return;
-        if (T.isF4() && (T_new.isF4() || T_new.isInt4())) return;
+        if (T.isF4() && (T_new.bits() == 4)) return;
         T = T.isSigned() ? T_new.asSigned() : T_new.asUnsigned();
     };
     update_type(problem_.Ta, Ta_new);
@@ -628,6 +639,7 @@ status_t gen_xe_systolic_kernel_desc_t::select_kernel(
     arch_ = convert_ngen_arch_to_dnnl(hw_);
     stepping_ = dev_info.stepping_id();
     problem_.product = product_;
+    l1_flush_wa_ = dev_info.has_l1_flush_bug();
     m_ = into<int>(m);
     n_ = into<int>(n);
     k_ = into<int>(k);

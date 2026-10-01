@@ -1,7 +1,7 @@
 /*******************************************************************************
 * Copyright 2022 Intel Corporation
 * Copyright 2024 FUJITSU LIMITED
-* Copyright 2025 Arm Ltd. and affiliates
+* Copyright 2025-2026 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "common/compiler_workarounds.hpp"
 #include "common/dnnl_thread.hpp"
-#include "cpu/aarch64/cpu_isa_traits.hpp"
 
+#include "cpu/aarch64/cpu_isa_traits.hpp"
 #include "cpu/aarch64/matmul/brgemm_matmul_reorders.hpp"
 
 namespace dnnl {
@@ -115,7 +116,7 @@ status_t brgemm_matmul_copy_reorder_t::pd_t::init(const engine_t *engine,
             = matmul_conf_for_reorder_.src_zp_type != brgemm_broadcast_t::none;
 
     // asimd not supported, so we need >sve_128
-    if (!mayiuse(sve_128)) return status::unimplemented;
+    VDISPATCH_REORDER(mayiuse(sve_128), VERBOSE_UNSUPPORTED_ISA);
     matmul_conf_for_reorder_.isa = get_max_cpu_isa();
 
     auto mask_ok = [&](bool check, int mask) {
@@ -132,20 +133,6 @@ status_t brgemm_matmul_copy_reorder_t::pd_t::init(const engine_t *engine,
     init_scratchpad();
 
     return status::success;
-}
-
-status_t brgemm_matmul_copy_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
-        const engine_t *engine, const primitive_attr_t *attr,
-        const engine_t *src_engine, const memory_desc_t *src_md,
-        const engine_t *dst_engine, const memory_desc_t *dst_md) {
-    using namespace status;
-
-    auto _pd = std::unique_ptr<pd_t>(new pd_t(
-            attr, src_engine->kind(), src_md, dst_engine->kind(), dst_md));
-    if (_pd == nullptr) return out_of_memory;
-    CHECK(_pd->init(engine, src_engine, dst_engine));
-    CHECK(_pd->init_scratchpad_md());
-    return safe_ptr_assign<reorder_pd_t>(*reorder_pd, _pd.release());
 }
 
 status_t brgemm_matmul_copy_reorder_t::execute_body(
@@ -182,7 +169,7 @@ status_t brgemm_matmul_copy_reorder_t::execute_body(
                 : (dt_sz) * (md).blk_off((d0), (d1)))
 
     parallel_nd(kernel_conf.batch, div_up(kernel_conf.N, kernel_conf.N_blk),
-            [&](dim_t batch, dim_t n_blk_idx) {
+            [= COMPAT_THIS_CAPTURE](dim_t batch, dim_t n_blk_idx) {
         const auto n = n_blk_idx * kernel_conf.N_blk;
         const bool is_N_tail = (kernel_conf.N - n < kernel_conf.N_blk);
         auto ker_exec_ctx = matmul::jit_brgemm_matmul_copy_b_t::ctx_t();

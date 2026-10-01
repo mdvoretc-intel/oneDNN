@@ -153,9 +153,9 @@ bool post_ops_ok(brgemm_matmul_conf_t &bgmmc, const primitive_attr_t &attr,
     bool is_binary_po_per_hw_bcast {};
     bool is_binary_po_batch_bcast {};
     std::tie(is_binary_po_per_oc_sp_bcast, is_binary_po_per_oc_d_bcast,
-            is_binary_po_channel_bcast, is_binary_po_per_mb_bcast,
-            is_binary_po_per_mb_w_bcast, is_binary_po_per_w_bcast,
-            is_binary_po_per_hw_bcast, is_binary_po_batch_bcast)
+            is_binary_po_per_mb_bcast, is_binary_po_channel_bcast,
+            is_binary_po_per_mb_w_bcast, is_binary_po_per_hw_bcast,
+            is_binary_po_per_w_bcast, is_binary_po_batch_bcast)
             = binary_injector_utils::bcast_strategies_present_tup(
                     post_ops.entry_, dst_d,
                     broadcasting_strategy_t::per_oc_spatial,
@@ -244,6 +244,8 @@ bool dims_adjacent(const memory_desc_wrapper &mdw, const int outer_dim,
     return strides[outer_dim] == dims[inner_dim] * inner_stride;
 }
 
+// Keep the per data type ISA lists below in sync with `set_isa_impl()` in
+// `brgemm/brgemm_utils.cpp`, which matches `brg->isa_user` by equality.
 status_t check_isa_with_datatype(
         const cpu_isa_t isa, const brgemm_matmul_conf_utils_t &bm_conf_utils) {
     const bool ok
@@ -255,7 +257,7 @@ status_t check_isa_with_datatype(
                             || is_superset(isa, avx2_vnni))
             && IMPLICATION(bm_conf_utils.is_bf16(),
                     one_of(isa, avx512_core_amx, avx512_core_bf16, avx2_vnni_2,
-                            avx10_2, avx10_2_ace))
+                            avx10_2, avx10_2_ace, avx10_2_amx_2))
             && IMPLICATION(bm_conf_utils.is_f16(),
                     one_of(isa, avx10_2, avx10_2_amx_2, avx512_core_amx_fp16,
                             avx512_core_fp16, avx2_vnni_2))
@@ -278,9 +280,10 @@ status_t check_isa_with_datatype(
             && IMPLICATION(bm_conf_utils.is_f32_with_int_wei(),
                     one_of(isa, avx512_core, avx2))
             && IMPLICATION(bm_conf_utils.is_bf16_fp8(),
-                    one_of(isa, avx512_core_amx, avx512_core_amx_fp16, avx10_2))
+                    one_of(isa, avx512_core_amx, avx10_2_amx_2,
+                            avx512_core_amx_fp16, avx10_2))
             && IMPLICATION(bm_conf_utils.is_f16_fp8(),
-                    one_of(isa, avx512_core_amx_fp16, avx10_2))
+                    one_of(isa, avx10_2_amx_2, avx512_core_amx_fp16, avx10_2))
             && IMPLICATION(bm_conf_utils.is_f8(),
                     is_superset(isa, avx512_core_amx_fp16)
                             || is_superset(isa, avx10_2))
@@ -1735,7 +1738,7 @@ status_t compute_blocking_heuristic_amx(brgemm_matmul_conf_t &bgmmc,
 status_t compute_blocking_heuristic(brgemm_matmul_conf_t &bgmmc,
         const brgemm_matmul_conf_utils_t &bm_conf_utils,
         const memory_desc_wrapper &dst_d, const primitive_attr_t &attr) {
-    const dim_t actual_ldd = dst_d.ndims() == 2 && bgmmc.M == 1
+    const dim_t actual_ldd = bgmmc.M == 1
             ? bgmmc.N
             : dst_d.blocking_desc().strides[bgmmc.ndims - 2];
     // Loop-invariant across every blocking candidate, so set it once here.
@@ -2927,7 +2930,11 @@ void init_aux_values(brgemm_matmul_conf_t &bgmmc,
                                           wei_stride / factor)
                 * factor;
     } else if (bgmmc.transposed_B) {
-        if (wei_d.strides()[bgmmc.ndims - 1] == 1) {
+        // A transposed md has an N stride of at least K, so an N stride of 1
+        // means the md is actually plain and only got a transposed tag forced
+        // (e.g. N == 1). K == 1 is the exception: the md is both plain and
+        // transposed and its N stride is the valid transposed stride.
+        if (wei_d.strides()[bgmmc.ndims - 1] == 1 && bgmmc.K > 1) {
             const auto b_stride_elems
                     = bgmmc.req_wei_vnni_downconvert ? bgmmc.LDB : bgmmc.N;
             bgmmc.copy_B_wei_stride = b_stride_elems * bgmmc.b_dt_sz;

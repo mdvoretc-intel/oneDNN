@@ -1,6 +1,6 @@
 /*******************************************************************************
 * Copyright 2016 Intel Corporation
-* Copyright 2020-2023 Arm Ltd. and affiliates
+* Copyright 2020-2023, 2026 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@
 #define CPU_INSTANCE_AARCH64(...) DNNL_AARCH64_ONLY(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_AARCH64_ACL(...) \
     DNNL_AARCH64_ACL_ONLY(CPU_INSTANCE(__VA_ARGS__))
+#define CPU_INSTANCE_AARCH64_KAI(...) \
+    DNNL_AARCH64_KAI_ONLY(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_X64_ZEN(...) DNNL_X64_ZEN(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_RV64(...) DNNL_RV64_ONLY(CPU_INSTANCE(__VA_ARGS__))
 #define CPU_INSTANCE_PPC64(...) DNNL_PPC64_ONLY(CPU_INSTANCE(__VA_ARGS__))
@@ -75,6 +77,7 @@ DECLARE_IMPL_LIST(matmul);
 DECLARE_IMPL_LIST(pooling);
 DECLARE_IMPL_LIST(prelu);
 DECLARE_IMPL_LIST(reduction);
+DECLARE_IMPL_LIST(reorder);
 DECLARE_IMPL_LIST(resampling);
 DECLARE_IMPL_LIST(rnn);
 DECLARE_IMPL_LIST(shuffle);
@@ -85,8 +88,6 @@ DECLARE_IMPL_LIST(softmax);
 class cpu_engine_impl_list_t {
 public:
     static const impl_list_item_t *get_concat_implementation_list();
-    static const impl_list_item_t *get_reorder_implementation_list(
-            const memory_desc_t *src_md, const memory_desc_t *dst_md);
     static const impl_list_item_t *get_sum_implementation_list();
 
     static const impl_list_item_t *get_implementation_list(
@@ -111,6 +112,7 @@ public:
             CASE(pooling);
             CASE(prelu);
             CASE(reduction);
+            CASE(reorder);
             CASE(resampling);
             CASE(rnn);
             CASE(shuffle);
@@ -140,12 +142,6 @@ public:
         return cpu_engine_impl_list_t::get_concat_implementation_list();
     }
 
-    const impl_list_item_t *get_reorder_implementation_list(
-            const memory_desc_t *src_md,
-            const memory_desc_t *dst_md) const override {
-        return cpu_engine_impl_list_t::get_reorder_implementation_list(
-                src_md, dst_md);
-    }
     const impl_list_item_t *get_sum_implementation_list() const override {
         return cpu_engine_impl_list_t::get_sum_implementation_list();
     }

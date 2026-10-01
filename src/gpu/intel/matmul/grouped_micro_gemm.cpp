@@ -80,6 +80,7 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
     };
 
     GEMMProblem problem;
+    problem.product = product;
     problem.Ta_ext = convert_dnnl_to_kernel_type(wei_mdw.data_type());
     problem.Tb_ext = convert_dnnl_to_kernel_type(src_mdw.data_type());
     problem.Tc_ext = problem.Ts = problem.Tc = Type::f32;
@@ -140,7 +141,8 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
             static_cast<int>(types::elements_to_bytes(adt, lda))));
 
     auto ldb_bytes = types::elements_to_bytes(bdt, ldb);
-    if (ldb_bytes % block_2d_base_alignment(hw) == 0) {
+    if (dev_info->gpu_arch() >= compute::gpu_arch_t::xe_hpc
+            && ldb_bytes % block_2d_base_alignment(hw) == 0) {
         problem.B.setAlignment(static_cast<int>(ldb_bytes));
     } else {
         problem.B.setAlignment(alignmentForLD(static_cast<int>(ldb)));
@@ -220,12 +222,14 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
     // - Xe3p: Not supported, require s4->s8 upconversion
     // - pre-Xe3p: supported, but only when s4 matrix doesn't have zero points
     bool has_s8s4_dpas = dev_info->gpu_arch() != compute::gpu_arch_t::xe3p;
-    if (problem.Ta_ext.isInt4() && problem.Tb_ext.isInt8()) {
-        bool s8s4_dpas_ok = has_s8s4_dpas && !opts.offsetA;
+    if (problem.Ta_ext.isSubByteInt() && problem.Tb_ext.isInt8()) {
+        bool s8s4_dpas_ok = (problem.Ta_ext.bits() == 4) && has_s8s4_dpas
+                && !opts.offsetA;
         if (!s8s4_dpas_ok) problem.Ta = Type::s8;
     }
-    if (problem.Tb_ext.isInt4() && problem.Ta_ext.isInt8()) {
-        bool s8s4_dpas_ok = has_s8s4_dpas && !opts.offsetB;
+    if (problem.Tb_ext.isSubByteInt() && problem.Ta_ext.isInt8()) {
+        bool s8s4_dpas_ok = (problem.Tb_ext.bits() == 4) && has_s8s4_dpas
+                && !opts.offsetB;
         if (!s8s4_dpas_ok) problem.Tb = Type::s8;
     }
 
@@ -270,7 +274,7 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
             Scalar alpha((int)a), beta((int)b);
             std::string strategyString;
             std::getline(ss >> std::ws, strategyString);
-            parseStrategy(strategyString, hw, problem, strat);
+            parseStrategy(strategyString, problem, strat);
             adjustStrategy(hw, problem, strat);
         }
         strategyGRFs_ = strat.GRFs;
@@ -317,7 +321,8 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
                                        && problem.Ta_ext.isInteger())
                         ? sg_size_ * problem.Ta_ext
                         : 16;
-                if (is_xelpg && problem.Ta_ext.bits() <= 8) {
+                if (is_xelpg && !hw_info.systolicAvailable
+                        && problem.Ta_ext.bits() <= 8) {
                     min_n_unroll = (opts.scaleA || opts.scaleB) ? sg_size_ : 4;
                 }
                 if (!dev_info->mayiuse_systolic()) max_wg_n = 2;
@@ -325,9 +330,11 @@ status_t grouped_micro_gemm_t::pd_t::init_microkernels(
             } break;
             case compute::gpu_arch_t::xe_hpc: max_n_unroll = 32; break;
             default:
-                m_unroll = sg_size_ / problem.Ta_ext;
-                max_n_unroll
-                        = problem.Ta.isInt4() ? sg_size_ * problem.Ta_ext : 32;
+                if (problem.Tb != Type::f32) {
+                    m_unroll = std::max<dim_t>(
+                            sg_size_, sg_size_ / problem.Ta_ext);
+                }
+                max_n_unroll = 32;
         }
 
         reqs.push_back(StrategyRequirement::UnrollM == m_unroll);
@@ -647,7 +654,8 @@ status_t grouped_micro_gemm_t::pd_t::init_kernel_ctx_m_axis() {
         kernel_ctx_.define_int("SRC_GROUP_SIZE", src_group_sizes_[1]);
     }
     if (wei_quant_.with_scale() || wei_quant_.with_zp()) {
-        kernel_ctx_.define_int("WEI_GROUP_SIZE", wei_group_sizes_[1]);
+        kernel_ctx_.define_int("WEI_K_GROUP_SIZE", wei_group_sizes_[1]);
+        kernel_ctx_.define_int("WEI_N_GROUP_SIZE", wei_group_sizes_[2]);
     }
 
     kernel_ctx_.define_int("SRC_SCALES_GROUPED",
@@ -970,7 +978,9 @@ status_t grouped_micro_gemm_t::execute_m_axis(const exec_ctx_t &ctx) const {
     compute::range_t gws = lws;
     // Swap wg_tile_[mn]_ for col-major vs row-major representations
     gws[0] *= utils::div_up(n, wg_tile_m);
-    gws[1] *= utils::div_up(m_dispatch, wg_tile_n);
+    // Sparse (gemv) dispatch derives the M offset from the flat token index
+    // in dim 2, so dim 1 only needs a single work-group.
+    gws[1] *= pd()->is_gemv_ ? 1 : utils::div_up(m_dispatch, wg_tile_n);
     gws[2] *= pd()->is_gemv_ ? m_all : pd()->ngroups_;
 
     return parallel_for(ctx, compute::nd_range_t(gws, lws), kernel_, arg_list);

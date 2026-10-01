@@ -162,6 +162,7 @@ struct CommonState {
     ngen::Subregister lid0;
     GRFMultirange indexVec;                         // uw
     int ivEntries = 0;
+    int aqCopies = 1, bqCopies = 1;             // sub-GRF copies of repacked A/B scales/offsets (Xe3p+)
     struct {
         ngen::GRF zero, one;
         ngen::GRFRange src1Storage;
@@ -285,6 +286,10 @@ struct GEMMState : public CommonState {
     std::vector<ngen::GRFRange> A_offsetAddrs, B_offsetAddrs;
     std::vector<ngen::GRFRange> A_scaleAddrs, B_scaleAddrs, C_scaleAddrs;
     std::vector<ngen::GRFRange> Ag_addrs, Bg_addrs;
+    // Auxiliary (quantization) prefetch addresses, advanced with the A/B prefetch schedule (strategy.pfaux).
+    std::vector<ngen::GRFRange> Ap_offsetAddrs, Bp_offsetAddrs;
+    std::vector<ngen::GRFRange> Ap_scaleAddrs, Bp_scaleAddrs;
+    std::vector<ngen::GRFRange> Agp_addrs, Bgp_addrs;
     std::vector<GRFMultirange> A_regs, B_regs, C_regs;
     GRFMultirange Ar_regs, Br_regs;                         // Repacked A/B registers.
     GRFMultirange Cr_regs;                                  // C registers to be repacked.

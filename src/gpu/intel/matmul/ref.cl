@@ -54,7 +54,15 @@
     (pfx##_stride_d0 * d0 + pfx##_stride_d1 * d1 + pfx##_stride_d2 * d2)
 
 __kernel void ref_matmul(__global SRC_DATA_T *A, __global WEI_DATA_T *B,
-        __global DST_DATA_T *C, __global BIA_DATA_T *bia,
+#if WITH_DYN_DST_SCALE
+        __global float *C,
+#else
+        __global DST_DATA_T *C,
+#endif
+#if WITH_SUM
+        __global SUM_DATA_T *C_sum,
+#endif
+        __global BIA_DATA_T *bia,
 #if WITH_HOST_SRC_ZP
         SRC_ZP_DATA_T a0_value,
 #else
@@ -98,16 +106,20 @@ __kernel void ref_matmul(__global SRC_DATA_T *A, __global WEI_DATA_T *B,
 #else
         __global DST_SCALES_DATA_T *dst_scales,
 #endif
-        __global SRC_GS_DATA_T *ag, long src_gs_stride_k, long src_gs_stride_m,
-        long src_gs_stride_d0, long src_gs_stride_d1, long src_gs_stride_d2,
-        long src_gs_group_k, long group_K, long K, long N, long M, long D0,
-        long D1, long D2, long bia_stride_d3, long bia_stride_d2,
-        long bia_stride_d1, long bia_stride_d0, long bia_stride_m,
-        long bia_stride_n, long a_stride_d3, long a_stride_d2, long a_stride_d1,
-        long a_stride_d0, long a_stride_m, long a_stride_k, long b_stride_d3,
-        long b_stride_d2, long b_stride_d1, long b_stride_d0, long b_stride_k,
-        long b_stride_n, long c_stride_d3, long c_stride_d2, long c_stride_d1,
-        long c_stride_d0, long c_stride_m, long c_stride_n
+        long dst_scale_stride_n, long dst_scale_stride_m,
+        long dst_scale_stride_d0, long dst_scale_stride_d1,
+        long dst_scale_stride_d2, long dst_scale_group_n,
+        long dst_scale_group_m, __global SRC_GS_DATA_T *ag,
+        long src_gs_stride_k, long src_gs_stride_m, long src_gs_stride_d0,
+        long src_gs_stride_d1, long src_gs_stride_d2, long src_gs_group_k,
+        long group_K, long K, long N, long M, long D0, long D1, long D2,
+        long bia_stride_d3, long bia_stride_d2, long bia_stride_d1,
+        long bia_stride_d0, long bia_stride_m, long bia_stride_n,
+        long a_stride_d3, long a_stride_d2, long a_stride_d1, long a_stride_d0,
+        long a_stride_m, long a_stride_k, long b_stride_d3, long b_stride_d2,
+        long b_stride_d1, long b_stride_d0, long b_stride_k, long b_stride_n,
+        long c_stride_d3, long c_stride_d2, long c_stride_d1, long c_stride_d0,
+        long c_stride_m, long c_stride_n
 #if WITH_DROPOUT
         ,
         __global uchar *dropout_mask_buf,
@@ -279,7 +291,11 @@ __kernel void ref_matmul(__global SRC_DATA_T *A, __global WEI_DATA_T *B,
 
     float dst_data;
 #if WITH_SUM
-    dst_data = SUM_TO_REF(C[dst_off]);
+#if DST_PACKED
+    dst_data = SUM_TO_REF(GET_HALF_BYTE(C_sum, dst_off));
+#else
+    dst_data = SUM_TO_REF(C_sum[dst_off]);
+#endif
 #endif // WITH_SUM
 
     float po_acc = convert_float(temp);
@@ -316,19 +332,22 @@ __kernel void ref_matmul(__global SRC_DATA_T *A, __global WEI_DATA_T *B,
 #if DST_SCALES_MASK == 0
     po_acc /= DST_SCALES_TO_REF(dst_scales[0]);
 #elif WITH_DYN_DST_SCALE == 0
-    po_acc /= DST_SCALES_TO_REF(dst_scales[n]);
+    long dst_scale_off = dst_scale_stride_n * (n / dst_scale_group_n)
+            + dst_scale_stride_m * (m / dst_scale_group_m)
+            + BATCH_OFF(dst_scale);
+    po_acc /= DST_SCALES_TO_REF(dst_scales[dst_scale_off]);
 #endif
 #endif
     po_acc += dst_zp;
 
 #if WITH_DYN_DST_SCALE
-    ((__global ACC_DATA_T *)C)[dst_off] = po_acc;
+    C[dst_off] = po_acc;
 #else
     C[dst_off] = TO_DST(po_acc);
 #endif
 #else // WITH_BIAS || NON_DEFAULT_ATTRS
 #if WITH_DYN_DST_SCALE
-    ((__global ACC_DATA_T *)C)[dst_off] = acc;
+    C[dst_off] = acc;
 #else
     C[dst_off] = TO_DST(acc);
 #endif

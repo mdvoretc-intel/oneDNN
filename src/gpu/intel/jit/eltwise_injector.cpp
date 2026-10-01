@@ -225,7 +225,7 @@ void eltwise_injector_f32_t<ngen_generator_t>::soft_relu_compute_fwd_inner(
     const float reciproc_log2e = 1.f / log2e; // 1 / log_2(e)
     switch (phase) {
         case 0: h->mul(simd, temp, input, alpha); break;
-        case 1: h->add(simd, dest, input, -exp_overflow_bound); break;
+        case 1: h->add(simd, dest, temp, -exp_overflow_bound); break;
         case 2: h->csel(simd | le | f0[0], dest, dest, temp, dest); break;
         case 3: h->mul(simd, temp, temp, log2e); break;
         case 4: h->exp(simd, temp, temp); break;
@@ -988,9 +988,15 @@ void eltwise_injector_f32_t<ngen_generator_t>::compute(const int *grfs,
 
                 int simd = nreg * GRF::bytes(hw()) / sizeof(float);
 
-                auto grf0_t = grfs[idx0 + (ii / 2)];
-                auto base_t = GRF(grf0_t).f();
-                auto grf1 = grfs[idx0 + off + (ii / 2)];
+                auto base_t = base;
+                int grf1 = grf0;
+                if (alg_ == eltwise_mx_scale) {
+                    gpu_assert(off > 0 && batch % (2 * off) == 0);
+                    int g_idx = ii / 2;
+                    int lo = idx0 + g_idx + off * (g_idx / off);
+                    base_t = GRF(grfs[lo]).f();
+                    grf1 = grfs[lo + off];
+                }
                 if (is_fwd_) {
                     switch ((int)alg_) {
                         case eltwise_elu:
