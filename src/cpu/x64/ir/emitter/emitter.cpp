@@ -90,10 +90,6 @@ void emit(backend_t &be, const ir_t &ir, const reg_alloc_result_t &alloc,
     // a spilled result back is done by the defining instruction (compute into
     // scratch, then store to the slot).
     //
-    // TODO: introduce loop-depth spill weights to optimize spills. Currently,
-    // the spilling strategy is naive and is only good for low pressure kernels
-    // (e.g. GEMV).
-    //
     // gpr reloads are ISA-neutral (a plain `mov`), so `gpr_use` emits them
     // directly. A spilled vec source is reloaded through the backend, since the
     // reload instruction is ISA-specific. The `vec_use` returns a physical
@@ -223,6 +219,13 @@ void emit(backend_t &be, const ir_t &ir, const reg_alloc_result_t &alloc,
                 int base = gpr_use(op.mem.base, gpr_scratch0).getIdx();
                 int s = vec_use(op.s0, vec_scratch0);
                 be.vstore_scalar(base, op.mem.disp, s, op.mem_dt, dt_of(op.s0));
+                break;
+            }
+            case op_kind_t::vload_bcast: { // overwrites dst
+                int base = gpr_use(op.mem.base, gpr_scratch0).getIdx();
+                int d = spilled(op.dst) ? vec_scratch0 : phys(op.dst);
+                be.vload_bcast(d, base, op.mem.disp, op.mem_dt, dt_of(op.dst));
+                if (spilled(op.dst)) spill_store(op.dst, d);
                 break;
             }
             case op_kind_t::vdot: { // rmw: reads and writes dst

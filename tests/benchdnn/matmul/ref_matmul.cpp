@@ -344,8 +344,9 @@ static void compute_ref_matmul_chunk(const chunk_params_t &p, int64_t M,
             dst_zp = p.dst_zps->get_elem(dst_zp_idx);
         }
         if (p.has_dst_scale && !p.has_dst_dynamic) {
-            dst_scale = 1.f
-                    / p.dst_scales->get_f32_elem(p.dst_scale_mask > 0 ? n : 0);
+            const auto dscale_idx = p.dst_m->get_idx(dst_off, p.dst_scale_mask,
+                    p.dst_m->ndims(), p.dst_scale_groups);
+            dst_scale = 1.f / p.dst_scales->get_f32_elem(dscale_idx);
         }
         float dst = p.dst_m->get_f32_elem(dst_off);
         float dst_val = dst_scale * dst + dst_zp;
@@ -390,27 +391,32 @@ void compute_ref_grouped_matmul(const prb_t *prb, const args_t &args) {
 
     std::vector<int64_t> group_offsets(group_count + 1);
     group_offsets[0] = 0;
-    int64_t max_group_size = 0;
-    for (int64_t g = 0; g < group_count; g++) {
+    for (int64_t g = 0; g < group_count; g++)
         group_offsets[g + 1] = group_offsets[g] + group_sizes[g];
-        max_group_size = MAX2(max_group_size, group_sizes[g]);
-    }
 
     // Precompute common parameters for the different chunks computations
     const chunk_params_t params = make_chunk_params(prb, args);
 
-    // For var_M, M differs per group; for var_K, M is fixed
-    const int64_t M_chunks
-            = div_up(var_M ? max_group_size : prb->m, params.dst_M_group);
     const int64_t N_chunks = div_up(prb->n, params.dst_N_group);
 
-    // Parallelize over groups and (mc, nc) chunks within each group
-    benchdnn_parallel_nd(group_count, M_chunks, N_chunks,
-            [&](int64_t g, int64_t mc, int64_t nc) {
+    // Compute flattened M-chunks offsets
+    // Allows different parallelization so to avoid almost sequential execution
+    // if single group holds almost all of the tokens (e.g., "hot" profile)
+    std::vector<int64_t> chunk_offsets(group_count + 1);
+    chunk_offsets[0] = 0;
+    for (int64_t g = 0; g < group_count; g++) {
+        const int64_t M = var_M ? group_sizes[g] : prb->m;
+        chunk_offsets[g + 1] = chunk_offsets[g] + div_up(M, params.dst_M_group);
+    }
+    const int64_t M_chunks = chunk_offsets[group_count];
+
+    benchdnn_parallel_nd(M_chunks, N_chunks, [&](int64_t fmc, int64_t nc) {
+        const int64_t g = std::upper_bound(chunk_offsets.begin(),
+                                  chunk_offsets.end(), fmc)
+                - chunk_offsets.begin() - 1;
+        const int64_t mc = fmc - chunk_offsets[g];
         const int64_t off = group_offsets[g];
         const int64_t M = var_M ? group_sizes[g] : prb->m;
-        if (M == 0) return;
-        if (mc * params.dst_M_group >= M) return;
 
         // Per-group base offsets:
         //   src(m, k) = src_base + m * K + k

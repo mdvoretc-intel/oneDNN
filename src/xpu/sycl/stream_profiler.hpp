@@ -32,11 +32,15 @@ struct stream_profiler_t : public xpu::stream_profiler_t {
 
     status_t get_info(profiling_data_kind_t data_kind, int *num_entries,
             uint64_t *data) const override;
+
+protected:
+    status_t query_event_time(const xpu::event_t &event, uint64_t &start,
+            uint64_t &end) const override;
 };
 
 struct verbose_profiler_t : public xpu::verbose_profiler_t {
     verbose_profiler_t(const impl::stream_t *stream)
-        : xpu::verbose_profiler_t(stream) {}
+        : xpu::verbose_profiler_t(stream), use_ext_oneapi_tag_(false) {}
 
     ~verbose_profiler_t() override { cleanup(); }
 
@@ -48,6 +52,12 @@ struct verbose_profiler_t : public xpu::verbose_profiler_t {
 
     void wait_for_event_completion(
             const std::shared_ptr<xpu::event_t> &event) const override;
+
+    bool use_ext_oneapi_tag() const { return use_ext_oneapi_tag_; }
+    void set_use_ext_oneapi_tag(bool flag) { use_ext_oneapi_tag_ = flag; }
+
+private:
+    bool use_ext_oneapi_tag_;
 };
 
 } // namespace sycl

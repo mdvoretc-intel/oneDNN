@@ -17,6 +17,7 @@
 
 #include <cstddef>
 
+#include "cpu/rv64/cpu_isa_traits.hpp"
 #include "cpu/rv64/jit_rvv_softmax_kernel.hpp"
 
 namespace dnnl {
@@ -45,6 +46,17 @@ using namespace Xbyak_riscv;
     static_cast<int32_t>(offsetof( \
             jit_rvv_softmax_f32_reduce_max_kernel_t::call_params_t, field))
 
+template <bool gather>
+const jit_rvv_softmax_xf16_strided_kernel_t &get_xf16_strided_kernel() {
+    static const jit_rvv_softmax_xf16_strided_kernel_t kernel(gather);
+    return kernel;
+}
+
+template const jit_rvv_softmax_xf16_strided_kernel_t &
+get_xf16_strided_kernel<true>();
+template const jit_rvv_softmax_xf16_strided_kernel_t &
+get_xf16_strided_kernel<false>();
+
 namespace {
 
 template <bool src_f32, data_type_t dt>
@@ -57,8 +69,7 @@ void dispatch_xf16_affine(
 template <bool gather>
 void dispatch_xf16_strided(
         const jit_rvv_softmax_xf16_strided_kernel_t::call_params_t *p) {
-    static const jit_rvv_softmax_xf16_strided_kernel_t kernel(gather);
-    kernel(p);
+    get_xf16_strided_kernel<gather>()(p);
 }
 
 template <data_type_t dt>
@@ -520,6 +531,11 @@ jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::
 
 void jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::generate() {
 #if defined(XBYAK_RISCV_V) && XBYAK_RISCV_V == 1
+    const bool hoist_poly_coeffs = get_platform_vlen() >= 256;
+    // Share exact coefficient bits between hoisted and in-loop loads.
+    constexpr uint32_t poly_coeffs[]
+            = {0x3c092f6eu, 0x3d2aadadu, 0x3e2aaa28u, 0x3efffffbu, 0x3f800000u};
+
     const Reg reg_param = a0;
     const Reg reg_src = a1;
     const Reg reg_tmp = a2;
@@ -542,6 +558,11 @@ void jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::generate() {
     const FReg f_sub = fa0;
     const FReg f_poly = ft7;
     const FReg f_poly_coeff = ft8;
+    const FReg f_poly_coeff0 = ft8;
+    const FReg f_poly_coeff1 = ft9;
+    const FReg f_poly_coeff2 = ft11;
+    const FReg f_poly_coeff3 = fa1;
+    const FReg f_poly_coeff4 = fa2;
     const FReg f_sum = ft10;
 
     const VReg v_in16(0);
@@ -560,6 +581,11 @@ void jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::generate() {
     auto load_f32 = [&](const FReg &freg, float value) {
         load_f32_bits(freg, utils::bit_cast<uint32_t>(value));
     };
+    auto add_poly_coeff = [&](const FReg &hoisted_coeff, uint32_t bits) {
+        const FReg &coeff = hoist_poly_coeffs ? hoisted_coeff : f_poly_coeff;
+        if (!hoist_poly_coeffs) load_f32_bits(coeff, bits);
+        vfadd_vf(v_poly, v_poly, coeff);
+    };
 
     ld(reg_src, reg_param, XF16_EXP_SUB_SUM_OFF(src));
     ld(reg_tmp, reg_param, XF16_EXP_SUB_SUM_OFF(tmp));
@@ -576,6 +602,13 @@ void jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::generate() {
     load_f32_bits(f_log2_high, 0xbf317200u);
     load_f32_bits(f_log2_low, 0xb5bfbe8eu);
     load_f32_bits(f_poly, 0x3ab4a000u);
+    if (hoist_poly_coeffs) {
+        load_f32_bits(f_poly_coeff0, poly_coeffs[0]);
+        load_f32_bits(f_poly_coeff1, poly_coeffs[1]);
+        load_f32_bits(f_poly_coeff2, poly_coeffs[2]);
+        load_f32_bits(f_poly_coeff3, poly_coeffs[3]);
+        load_f32_bits(f_poly_coeff4, poly_coeffs[4]);
+    }
     li(reg_minexp, static_cast<int64_t>(0xC1000000u));
     li(reg_maxexp, static_cast<int64_t>(0x3F800000u));
 
@@ -607,21 +640,16 @@ void jit_rvv_softmax_xf16_exp_sub_sum_kernel_t::generate() {
     vfmacc_vf(v_x, f_log2_high, v_tmpv);
     vfmacc_vf(v_x, f_log2_low, v_tmpv);
     vfmv_v_f(v_poly, f_poly);
-    load_f32_bits(f_poly_coeff, 0x3c092f6eu);
     vfmul_vv(v_poly, v_poly, v_x);
-    vfadd_vf(v_poly, v_poly, f_poly_coeff);
-    load_f32_bits(f_poly_coeff, 0x3d2aadadu);
+    add_poly_coeff(f_poly_coeff0, poly_coeffs[0]);
     vfmul_vv(v_poly, v_poly, v_x);
-    vfadd_vf(v_poly, v_poly, f_poly_coeff);
-    load_f32_bits(f_poly_coeff, 0x3e2aaa28u);
+    add_poly_coeff(f_poly_coeff1, poly_coeffs[1]);
     vfmul_vv(v_poly, v_poly, v_x);
-    vfadd_vf(v_poly, v_poly, f_poly_coeff);
-    load_f32_bits(f_poly_coeff, 0x3efffffbu);
+    add_poly_coeff(f_poly_coeff2, poly_coeffs[2]);
     vfmul_vv(v_poly, v_poly, v_x);
-    vfadd_vf(v_poly, v_poly, f_poly_coeff);
-    load_f32_bits(f_poly_coeff, 0x3f800000u);
+    add_poly_coeff(f_poly_coeff3, poly_coeffs[3]);
     vfmul_vv(v_poly, v_poly, v_x);
-    vfadd_vf(v_poly, v_poly, f_poly_coeff);
+    add_poly_coeff(f_poly_coeff4, poly_coeffs[4]);
     vsll_vi(v_bias, v_bias, 23);
     vmin_vx(v_tmpv, v_bias, reg_maxexp);
     vmax_vx(v_tmpv, v_tmpv, reg_minexp);

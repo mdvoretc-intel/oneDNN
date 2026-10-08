@@ -238,8 +238,12 @@ void Generator<hw>::gemmVectorBinaryOpC(BinaryOp op, bool column, const GRFMulti
             auto nco = (column ? j : i) * crosspack;
             auto offBase = (*offsetsPtr)[nco / ne].sub(nco % ne, Tacc.ngen());
             if (scale.isValid()) {
-                if (op != BinaryOp::Add) stub();
-                mad(nc, C(1), C(1), offBase(stride()), scale);
+                if (op == BinaryOp::Add)
+                    mad(nc, C(1), C(1), offBase(stride()), scale);
+                else if (op == BinaryOp::Sub)
+                    mad(nc, C(1), C(1), offBase(stride()), -scale);
+                else
+                    stub();
             } else if (strategy.dotVL > 0) {
                 // Dot-based kernels pack the C-tile into one register when possible, which results in
                 // register region restriction complications. Split binary operations into execSize=1 pieces.
@@ -670,8 +674,24 @@ void Generator<hw>::gemmApplyMXScale(const GEMMProblem &problem, const GEMMStrat
     int n_regs = std::max(1, (n_elems * m_stride) / GRF::bytes(hw));
     auto tmpCScales = state.ra.alloc_range(n_regs);
     vector<MaskAssignment> masks;
-    assignMasks(state.C_scaleLayout, LoopNone, LoopN, masks, strategy, state);
-    loadMasks(masks, state.remainders, strategy, state);
+    // Without a row mask, an M-remainder tile may store its out-of-range group
+    // rows past the end of the scale row, corrupting the next column's
+    // first scale entries. Mask rows using the M remainder converted to group units.
+    bool maskM = state.remainders[LoopM].isValid()
+            && (unrollM > problem.cqGroupM);
+    if (maskM && !ngen::utils::is_zero_or_pow2(problem.cqGroupM)) stub();
+    assignMasks(state.C_scaleLayout, maskM ? LoopM : LoopNone, LoopN, masks, strategy, state);
+    if (maskM) {
+        Subregister remInd[3];
+        for (int i = 0; i < 3; i++) remInd[i] = state.remainders[i];
+        auto qremM = state.ra.alloc_sub<uint32_t>();
+        add(1 | sat, qremM, state.remainders[LoopM], problem.cqGroupM - 1);
+        shr(1, qremM, qremM, ilog2(problem.cqGroupM));
+        remInd[LoopM] = qremM;
+        loadMasks(masks, remInd, strategy, state);
+        state.ra.safeRelease(qremM);
+    } else
+        loadMasks(masks, state.remainders, strategy, state);
 
     problem.postOps.injectMXScale(this, state.ra, C_grfs, C_ngrf, tmpCScales.sub(hw, 0, ngen::DataType::ub), problem.Tc_ext.ngen(), unrollN);
     storeMatrix(tmpCScales, state.C_scaleLayout, state.C_scaleAddrs, strategy, state);
@@ -811,6 +831,10 @@ void Generator<hw>::gemmApplyABOffset(const GEMMProblem &problem, const GEMMStra
 
     bool aoVector = aOffset && (problem.aoPtrDims == 1);
     bool boVector = bOffset && (problem.boPtrDims == 1);
+    // Host-scalar ao/bo are raw (non-negated), unlike vector/device-memory
+    // scalars which are pre-negated on load.
+    bool a_host_scalar = problem.aOffsetHostScalar();
+    bool b_host_scalar = problem.bOffsetHostScalar();
     GRFRange aoData, boData;
 
     auto temp = [&]() {
@@ -818,7 +842,9 @@ void Generator<hw>::gemmApplyABOffset(const GEMMProblem &problem, const GEMMStra
 
         auto ret = state.ra.alloc_sub(problem.Tc.ngen());
         if (!boVector)
-            mul(1, ret, state.k, state.inputs.bo);
+            mul(1, ret, state.k,
+                    (aoVector && b_host_scalar) ? -state.inputs.bo
+                                                 : state.inputs.bo);
         else
             mov(1, ret, state.k);
 
@@ -861,7 +887,8 @@ void Generator<hw>::gemmApplyABOffset(const GEMMProblem &problem, const GEMMStra
 
         if (bOffset) {
             boVector ? gemmRank1UpdateC(state.As_regs, boData, problem, strategy, state)
-                     : gemmVectorBinaryOpC(BinaryOp::Add, false, state.As_regs, state.inputs.bo,
+                     : gemmVectorBinaryOpC(b_host_scalar ? BinaryOp::Sub : BinaryOp::Add, false,
+                                           state.As_regs, state.inputs.bo,
                                            problem, strategy, state, problem.Tc, state.As_layout);
         }
 
@@ -876,14 +903,15 @@ void Generator<hw>::gemmApplyABOffset(const GEMMProblem &problem, const GEMMStra
 
         if (aOffset) {
             aoVector ? gemmRank1UpdateC(aoData, state.Bs_regs, problem, strategy, state)
-                     : gemmVectorBinaryOpC(BinaryOp::Add, true,  state.Bs_regs, state.inputs.ao,
+                     : gemmVectorBinaryOpC(a_host_scalar ? BinaryOp::Sub : BinaryOp::Add, true,
+                                           state.Bs_regs, state.inputs.ao,
                                            problem, strategy, state, problem.Tc, state.Bs_layout);
         }
     } else {
         // Scalar offset path.
         // TODO: combine C adds into add3 on XeHP+.
         if (aOffset && bOffset) {
-            mul(1, temp, temp, state.inputs.ao);
+            mul(1, temp, temp, b_host_scalar ? -state.inputs.ao : state.inputs.ao);
             map(hw, Tc, state.Bs_regs, state.Bs_layout, strategy, [&](int ne, RegData r) {
                 mad(ne, r, temp, r, state.inputs.ao);
             });
@@ -893,8 +921,8 @@ void Generator<hw>::gemmApplyABOffset(const GEMMProblem &problem, const GEMMStra
         auto As_scale = state.inputs.bo;
         auto Bs_scale = (bOffset) ? Subregister() : state.inputs.ao;
 
-        if (bOffset) gemmVectorBinaryOpC(BinaryOp::Add, false, state.As_regs, As_scale, problem, strategy, state, problem.Tc, state.As_layout);
-        if (aOffset) gemmVectorBinaryOpC(BinaryOp::Add, true,  state.Bs_regs, Bs_scale, problem, strategy, state, problem.Tc, state.Bs_layout);
+        if (bOffset) gemmVectorBinaryOpC(b_host_scalar ? BinaryOp::Sub : BinaryOp::Add, false, state.As_regs, As_scale, problem, strategy, state, problem.Tc, state.As_layout);
+        if (aOffset) gemmVectorBinaryOpC(a_host_scalar ? BinaryOp::Sub : BinaryOp::Add, true,  state.Bs_regs, Bs_scale, problem, strategy, state, problem.Tc, state.Bs_layout);
     }
 
     state.ra.safeRelease(aoData);

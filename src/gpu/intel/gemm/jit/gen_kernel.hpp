@@ -56,6 +56,7 @@ static inline gemmstone::Type convert_dnnl_to_kernel_type(data_type_t type) {
         case data_type::s8: return Type::s8;
         case data_type::u4: return Type::u4;
         case data_type::s4: return Type::s4;
+        case data_type::u2: return Type::u2;
         case data_type::undef: return Type::invalid;
     }
 }
@@ -104,6 +105,7 @@ protected:
     ngen::HW hw_ = ngen::HW::Unknown;
     ngen::Product product_;
     int stepping_ = 0;
+    bool l1_flush_wa_ = false;
     gemmstone::GEMMProblem problem_ = {};
     gemmstone::GEMMStrategy strategy_;
     const gemmstone::kcatalog::Entry *entry_ = nullptr;
